@@ -42,9 +42,24 @@ var (
 	ErrServersUnreachable = errors.New("namecoin: all ElectrumX servers unreachable")
 )
 
+// rpcConn is the transport-agnostic RPC connection abstraction. Both
+// TCP (newline-delimited) and WebSocket (pre-framed) implementations
+// satisfy it so that the name_show flow can be written once.
+type rpcConn interface {
+	// writeRequest serialises and sends a single JSON-RPC request.
+	// Implementations are responsible for any framing the wire format
+	// requires (TCP appends a newline, WS does not).
+	writeRequest(ctx context.Context, method string, params []any, id int64) error
+	// readResponse returns one JSON-RPC response, blocking until one
+	// is available or the context/deadline fires.
+	readResponse(ctx context.Context) (string, error)
+	// close releases the underlying transport.
+	close() error
+}
+
 // ElectrumClient is a minimal, query-only Namecoin ElectrumX client.
-// It opens a short-lived TCP/TLS socket per request, which is plenty
-// for interactive CLI use.
+// It opens a short-lived socket per request, which is plenty for
+// interactive CLI use.
 type ElectrumClient struct {
 	ConnectTimeout time.Duration
 	ReadTimeout    time.Duration
@@ -68,18 +83,22 @@ func (c *ElectrumClient) NameShow(ctx context.Context, identifier string, server
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer conn.close()
 
-	_ = conn.SetDeadline(time.Now().Add(c.ReadTimeout))
+	// Give the whole request sequence a deadline. For TCP this is
+	// enforced by net.Conn.SetDeadline; for WS the per-call context
+	// carries the budget instead.
+	reqCtx, cancel := context.WithTimeout(ctx, c.ReadTimeout)
+	defer cancel()
 
-	reader := bufio.NewReader(conn)
+	next := func() int64 { return c.requestID.Add(1) }
 
 	// 1. Negotiate protocol version. The response is consumed and
 	//    discarded — we only care that the socket is alive.
-	if err := c.sendRPC(conn, "server.version", []any{"nak-namecoin/0.1", electrumProtocolVersion}); err != nil {
+	if err := conn.writeRequest(reqCtx, "server.version", []any{"nak-namecoin/0.1", electrumProtocolVersion}, next()); err != nil {
 		return nil, err
 	}
-	if _, err := reader.ReadString('\n'); err != nil {
+	if _, err := conn.readResponse(reqCtx); err != nil {
 		return nil, fmt.Errorf("namecoin: read version response: %w", err)
 	}
 
@@ -88,10 +107,10 @@ func (c *ElectrumClient) NameShow(ctx context.Context, identifier string, server
 	scriptHash := electrumScriptHash(script)
 
 	// 3. Fetch transaction history for that scripthash.
-	if err := c.sendRPC(conn, "blockchain.scripthash.get_history", []any{scriptHash}); err != nil {
+	if err := conn.writeRequest(reqCtx, "blockchain.scripthash.get_history", []any{scriptHash}, next()); err != nil {
 		return nil, err
 	}
-	histLine, err := reader.ReadString('\n')
+	histLine, err := conn.readResponse(reqCtx)
 	if err != nil {
 		return nil, fmt.Errorf("namecoin: read history response: %w", err)
 	}
@@ -108,19 +127,19 @@ func (c *ElectrumClient) NameShow(ctx context.Context, identifier string, server
 	latest := entries[len(entries)-1]
 
 	// 4. Fetch the verbose transaction.
-	if err := c.sendRPC(conn, "blockchain.transaction.get", []any{latest.TxHash, true}); err != nil {
+	if err := conn.writeRequest(reqCtx, "blockchain.transaction.get", []any{latest.TxHash, true}, next()); err != nil {
 		return nil, err
 	}
-	txLine, err := reader.ReadString('\n')
+	txLine, err := conn.readResponse(reqCtx)
 	if err != nil {
 		return nil, fmt.Errorf("namecoin: read transaction response: %w", err)
 	}
 
 	// 5. Get the current block height so we can compute expiry.
-	if err := c.sendRPC(conn, "blockchain.headers.subscribe", []any{}); err != nil {
+	if err := conn.writeRequest(reqCtx, "blockchain.headers.subscribe", []any{}, next()); err != nil {
 		return nil, err
 	}
-	headerLine, _ := reader.ReadString('\n')
+	headerLine, _ := conn.readResponse(reqCtx)
 	currentHeight := parseBlockHeight(headerLine)
 
 	if currentHeight > 0 && latest.Height > 0 {
@@ -161,10 +180,23 @@ func (c *ElectrumClient) NameShowWithFallback(ctx context.Context, identifier st
 	return nil, fmt.Errorf("%w: last error: %v", ErrServersUnreachable, lastErr)
 }
 
-// dial opens a TCP connection to the server, upgrading to TLS when
-// UseSSL is set. Honours both context cancellation and our connect
-// timeout, whichever fires first.
-func (c *ElectrumClient) dial(ctx context.Context, server ElectrumxServer) (net.Conn, error) {
+// dial picks the right transport implementation based on the server
+// configuration and returns a ready-to-use rpcConn.
+func (c *ElectrumClient) dial(ctx context.Context, server ElectrumxServer) (rpcConn, error) {
+	switch effectiveTransport(server) {
+	case TransportTCPTLS, TransportTCP:
+		return c.dialTCP(ctx, server)
+	case TransportWSS, TransportWS:
+		return c.dialWebSocket(ctx, server)
+	default:
+		return nil, fmt.Errorf("namecoin: unknown transport %d", server.Transport)
+	}
+}
+
+// dialTCP opens a raw TCP connection to the server, upgrading to TLS
+// when the effective transport is TCPTLS. Honours both context
+// cancellation and our connect timeout, whichever fires first.
+func (c *ElectrumClient) dialTCP(ctx context.Context, server ElectrumxServer) (rpcConn, error) {
 	dialer := &net.Dialer{Timeout: c.ConnectTimeout}
 	address := net.JoinHostPort(server.Host, strconv.Itoa(server.Port))
 
@@ -173,34 +205,41 @@ func (c *ElectrumClient) dial(ctx context.Context, server ElectrumxServer) (net.
 		return nil, fmt.Errorf("namecoin: dial %s: %w", address, err)
 	}
 
-	if !server.UseSSL {
-		return raw, nil
+	var nc net.Conn = raw
+	if effectiveTransport(server) == TransportTCPTLS {
+		cfg := tlsConfigFor(server)
+		tlsConn := tls.Client(raw, cfg)
+
+		// Run the handshake with a deadline so a silent server doesn't hang
+		// the call beyond what the caller asked for.
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = tlsConn.SetDeadline(deadline)
+		} else {
+			_ = tlsConn.SetDeadline(time.Now().Add(c.ConnectTimeout))
+		}
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("namecoin: TLS handshake with %s: %w", address, err)
+		}
+		// Clear the handshake deadline — we'll set fresh per-request
+		// deadlines below.
+		_ = tlsConn.SetDeadline(time.Time{})
+		nc = tlsConn
 	}
 
-	cfg := tlsConfigFor(server)
-	tlsConn := tls.Client(raw, cfg)
-
-	// Run the handshake with a deadline so a silent server doesn't hang
-	// the call beyond what the caller asked for.
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = tlsConn.SetDeadline(deadline)
-	} else {
-		_ = tlsConn.SetDeadline(time.Now().Add(c.ConnectTimeout))
-	}
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("namecoin: TLS handshake with %s: %w", address, err)
-	}
-	// Clear the handshake deadline — the caller sets its own read
-	// deadline afterwards.
-	_ = tlsConn.SetDeadline(time.Time{})
-	return tlsConn, nil
+	_ = nc.SetDeadline(time.Now().Add(c.ReadTimeout))
+	return &tcpRPCConn{conn: nc, reader: bufio.NewReader(nc)}, nil
 }
 
-// sendRPC writes a JSON-RPC 2.0 request (newline-terminated, per
-// Electrum's line-delimited protocol) to the connection.
-func (c *ElectrumClient) sendRPC(w net.Conn, method string, params []any) error {
-	id := c.requestID.Add(1)
+// tcpRPCConn is the newline-delimited JSON-RPC transport over raw
+// TCP or TCP+TLS. This matches the shape every Electrum / ElectrumX
+// client has used for the last decade.
+type tcpRPCConn struct {
+	conn   net.Conn
+	reader *bufio.Reader
+}
+
+func (t *tcpRPCConn) writeRequest(ctx context.Context, method string, params []any, id int64) error {
 	payload := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
@@ -212,10 +251,28 @@ func (c *ElectrumClient) sendRPC(w net.Conn, method string, params []any) error 
 		return fmt.Errorf("namecoin: marshal rpc request: %w", err)
 	}
 	encoded = append(encoded, '\n')
-	if _, err := w.Write(encoded); err != nil {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = t.conn.SetWriteDeadline(deadline)
+	}
+	if _, err := t.conn.Write(encoded); err != nil {
 		return fmt.Errorf("namecoin: write rpc request: %w", err)
 	}
 	return nil
+}
+
+func (t *tcpRPCConn) readResponse(ctx context.Context) (string, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = t.conn.SetReadDeadline(deadline)
+	}
+	line, err := t.reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return line, nil
+}
+
+func (t *tcpRPCConn) close() error {
+	return t.conn.Close()
 }
 
 // historyEntry is one row of `blockchain.scripthash.get_history`.
