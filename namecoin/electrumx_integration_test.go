@@ -49,3 +49,53 @@ func TestIntegration_ResolveAtTestlsBit(t *testing.T) {
 		t.Errorf("m@testls.bit pubkey = %s, want %s", got, testlsMPubkey)
 	}
 }
+
+// --- WSS (WebSocket over TLS) integration tests -----------------------
+//
+// These hit the same ElectrumX operators as the TCP tests above, but
+// over the WebSocket endpoints (ports 500xx+2 on testls, 570xx+2 on
+// nmc2.bitcoins.sk). Same pinned certs, same JSON-RPC protocol, just
+// different framing. The assertions match the TCP path because the
+// Namecoin blockchain is the source of truth.
+
+func TestIntegration_ResolveTestlsBit_WSS(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client := NewElectrumClient()
+	result, err := client.NameShowWithFallback(ctx, "d/testls", DefaultElectrumXServersWSS)
+	if err != nil {
+		t.Fatalf("NameShowWithFallback(d/testls, WSS): %v", err)
+	}
+	if result == nil {
+		t.Fatal("nil result")
+	}
+	pk, _, err := extractNostrFromValue(result.Value, &parsedIdentifier{"d/testls", "_", true})
+	if err != nil {
+		t.Fatalf("extractNostrFromValue: %v", err)
+	}
+	if pk != testlsRootPubkey {
+		t.Errorf("testls.bit (WSS) pubkey = %s, want %s", pk, testlsRootPubkey)
+	}
+}
+
+func TestIntegration_ResolveAtTestlsBit_WSS(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client := NewElectrumClient()
+	result, err := client.NameShowWithFallback(ctx, "d/testls", DefaultElectrumXServersWSS)
+	if err != nil {
+		t.Fatalf("NameShowWithFallback(d/testls, WSS): %v", err)
+	}
+	if result == nil {
+		t.Fatal("nil result")
+	}
+	pk, _, err := extractNostrFromValue(result.Value, &parsedIdentifier{"d/testls", "m", true})
+	if err != nil {
+		t.Fatalf("extractNostrFromValue: %v", err)
+	}
+	if pk != testlsMPubkey {
+		t.Errorf("m@testls.bit (WSS) pubkey = %s, want %s", pk, testlsMPubkey)
+	}
+}

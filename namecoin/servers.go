@@ -1,15 +1,59 @@
 package namecoin
 
+// Transport selects how an ElectrumX server is dialed. The zero value
+// is TransportTCPTLS, matching the traditional Electrum client path
+// and the behaviour shipped in v0.1.x. Callers that want WebSocket
+// (for example, browser/wasm targets or restricted networks that
+// block raw TCP) set this to TransportWSS.
+type Transport int
+
+const (
+	// TransportTCPTLS is raw TCP + TLS with newline-delimited JSON-RPC.
+	// This is the default and what most Namecoin ElectrumX clients use.
+	TransportTCPTLS Transport = iota
+	// TransportTCP is plaintext TCP — rarely used in practice but
+	// supported for completeness / local testing.
+	TransportTCP
+	// TransportWSS is WebSocket over TLS, using the ElectrumX WS
+	// endpoint (ports 500xx+2 on typical public servers). Messages
+	// are pre-framed by the WebSocket layer and MUST NOT carry a
+	// trailing newline.
+	TransportWSS
+	// TransportWS is plaintext WebSocket.
+	TransportWS
+)
+
 // ElectrumxServer is a single Namecoin ElectrumX endpoint.
 type ElectrumxServer struct {
 	Host string
 	Port int
 	// UseSSL indicates TLS should be negotiated over the raw socket.
+	// Kept for backwards compat with v0.1.x callers. When Transport
+	// is the zero value, UseSSL selects between TransportTCPTLS
+	// (UseSSL=true) and TransportTCP (UseSSL=false).
 	UseSSL bool
 	// UsePinnedTrustStore enables the pinned-cert trust anchor bundle
 	// for servers that present self-signed certificates. This is the
 	// norm for the public Namecoin ElectrumX ecosystem.
 	UsePinnedTrustStore bool
+	// Transport selects the dial transport. Zero value keeps v0.1.x
+	// semantics: if UseSSL is true it's TCP+TLS, otherwise plain TCP.
+	// Set explicitly to TransportWSS / TransportWS for WebSocket.
+	Transport Transport
+}
+
+// effectiveTransport resolves the transport to use for a server,
+// reconciling the legacy UseSSL bool with the explicit Transport
+// field. The explicit Transport wins when non-zero.
+func effectiveTransport(s ElectrumxServer) Transport {
+	if s.Transport != TransportTCPTLS {
+		return s.Transport
+	}
+	// Zero value: fall back to UseSSL for v0.1.x compatibility.
+	if s.UseSSL {
+		return TransportTCPTLS
+	}
+	return TransportTCP
 }
 
 // DefaultElectrumXServers is the built-in list of public Namecoin
@@ -24,11 +68,37 @@ var DefaultElectrumXServers = []ElectrumxServer{
 	{Host: "46.229.238.187", Port: 57002, UseSSL: true, UsePinnedTrustStore: true},
 }
 
+// DefaultElectrumXServersWSS is the WSS-preferred server list. It
+// points at the same operators as DefaultElectrumXServers but uses
+// their WebSocket-over-TLS endpoints. Useful for:
+//
+//   - Browser / wasm targets, where raw TCP is unavailable and the
+//     only viable transport is the browser's WebSocket API (which
+//     `github.com/coder/websocket` targets natively when compiled
+//     with GOOS=js GOARCH=wasm).
+//   - Restricted networks that block the traditional ElectrumX ports
+//     but allow outbound HTTPS/WSS.
+//   - Environments that prefer WSS on policy grounds (aligns with the
+//     broader Nostr ecosystem, which is WSS-everywhere).
+//
+// Ports are the ElectrumX convention of ELECTRUM_PORT+2 for the WSS
+// endpoint. Both listed operators expose these alongside their
+// TCP+TLS ports, sharing the same TLS certificate.
+var DefaultElectrumXServersWSS = []ElectrumxServer{
+	{Host: "electrumx.testls.space", Port: 50004, Transport: TransportWSS, UsePinnedTrustStore: true},
+	{Host: "nmc2.bitcoins.sk", Port: 57004, Transport: TransportWSS, UsePinnedTrustStore: true},
+	{Host: "46.229.238.187", Port: 57004, Transport: TransportWSS, UsePinnedTrustStore: true},
+}
+
 // PinnedElectrumXCerts is the PEM-encoded bundle of server
 // certificates we trust in addition to the system roots. These are
 // copied verbatim from the Kotlin Amethyst reference implementation.
 //
 // To refresh: `echo | openssl s_client -connect HOST:PORT 2>/dev/null | openssl x509 -outform PEM`
+//
+// The same certificates are served on the WSS endpoints (adjacent
+// ports on the same host), so a single pinned bundle covers both
+// transports.
 var PinnedElectrumXCerts = []string{
 	// electrumx.testls.space:50002 — expires 2027-05-04.
 	// Also covers the i665jpwsq46zlsdbnj4axgzd3s56uzey5uhotsnxzsknzbn36jaddsid.onion:50002

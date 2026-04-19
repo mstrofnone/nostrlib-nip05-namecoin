@@ -61,8 +61,8 @@ Ported from the Kotlin reference in Amethyst and the Swift port in Nostur.
 - **Net new code**: ~1.3k LOC across eight files, half of which is tests. Nothing global — no init funcs, no side effects at import time.
 - **Outbound TLS connections** from nostrlib itself. This is new: today, `nip05` only speaks HTTPS to user-provided domains. Here we dial a short list of public ElectrumX servers. Probably worth a CHANGELOG note.
 - **Pinned self-signed certs**. The two long-running public Namecoin ElectrumX endpoints (`electrumx.testls.space`, `nmc2.bitcoins.sk`) both serve self-signed certificates. We ship pinned PEMs in `servers.go` and only trust those for the pinned hostnames. Happy to drop this in favor of a "caller provides servers" API if you'd prefer nostrlib stay cert-policy-neutral.
-- **No new module dependencies**. Stdlib + `fiatjaf.com/nostr` types only.
-- **No background goroutines, no connection pooling.** One short-lived TCP/TLS socket per lookup. Cheap to call, easy to reason about.
+- **One new direct dep**: `github.com/coder/websocket` for the WSS transport. It's a zero-transitive-dep library and is *already* a transitive dep of `fiatjaf.com/nostr`, so it adds nothing new to the closure of a nostrlib build. (TCP+TLS path uses stdlib only.)
+- **No background goroutines, no connection pooling.** One short-lived socket per lookup. Cheap to call, easy to reason about.
 
 ## Happy to reshape
 
@@ -80,3 +80,15 @@ Totally fine. This repo stands alone as a usable Go package, and [`mstrofnone/na
 ## Nostr-native contribution path
 
 There's also a NIP-34 git patch event (kind:1617) against `nostrlib`'s master tip (`f50b7b0f8dcb`), addressed to your npub. Event id and nevent encoding are in the comment on nak PR #123.
+
+## Addendum — v0.2.0 adds WSS transport
+
+`v0.2.0` adds WebSocket-over-TLS as an alternative transport to the default TCP+TLS path. A single new field on `ElectrumxServer` (`Transport Transport`, zero value = TCP+TLS) lets callers opt in without breaking anything; `DefaultElectrumXServersWSS` is the WSS counterpart to the existing server list.
+
+Why this is extra interesting for nostrlib specifically:
+
+- **Browser / wasm.** `github.com/coder/websocket` (zero transitive deps) compiles cleanly under `GOOS=js GOARCH=wasm`, using the browser's native `WebSocket` constructor. That means `nip05/namecoin` would work from a nostrlib-in-wasm build — the same code path Go Nostr clients increasingly target for browser extensions and Tauri-style apps.
+- **Transport alignment.** The rest of nostrlib is WSS-all-the-way-down for relays; it's a little strange for a sub-library to be the one place that still opens raw TCP. WSS here matches that policy.
+- **Restricted networks.** Plenty of corporate / mobile networks block the classic Electrum ports but happily pass WSS. This is an easy reliability win without touching fiatjaf's trust model.
+
+Pinned-cert trust is shared between both transports: the two long-running public operators serve the same certificate on their `:50002` and `:50004` ports, so the `VerifyPeerCertificate` callback we already ship is transport-agnostic and no extra config is required.

@@ -51,15 +51,49 @@ Nothing else changes — package name, public API, and types are identical.
 
 Plus advanced types exposed for custom usage:
 
-- `ElectrumClient`, `ElectrumxServer`, `NameShowResult`
-- `DefaultElectrumXServers` (ordered public server list)
+- `ElectrumClient`, `ElectrumxServer`, `NameShowResult`, `Transport`
+- `DefaultElectrumXServers` (TCP+TLS, ordered public server list)
+- `DefaultElectrumXServersWSS` (WSS endpoints for browser/wasm / restricted networks)
 - Sentinels: `ErrNameNotFound`, `ErrNameExpired`, `ErrServersUnreachable`
+
+## Transports
+
+Two transports are supported: **TCP+TLS** (the default, what every
+traditional Electrum / ElectrumX client uses) and **WSS** (WebSocket
+over TLS). Both speak the same JSON-RPC; only the framing differs.
+
+- **TCP+TLS** is the default and what `QueryIdentifier` / `ResolveToJSONValue`
+  use out of the box via `DefaultElectrumXServers`. It connects on
+  ports `50002` / `57002` on the public servers.
+- **WSS** is useful in three situations:
+  - **Browser / wasm** targets, where raw TCP is not available. Build
+    `github.com/coder/websocket` with `GOOS=js GOARCH=wasm` and the
+    same code resolves `.bit` identifiers from inside a browser.
+  - **Restricted networks** that block the classic ElectrumX ports
+    but allow outbound HTTPS/WSS traffic.
+  - **Transport alignment** with the rest of the Nostr stack, which
+    is WSS-everywhere.
+
+Pick WSS explicitly by using the WSS server list or by constructing
+your own `ElectrumxServer` with `Transport: TransportWSS`:
+
+```go
+import "github.com/mstrofnone/nostrlib-nip05-namecoin/namecoin"
+
+client := namecoin.NewElectrumClient()
+result, err := client.NameShowWithFallback(ctx, "d/testls", namecoin.DefaultElectrumXServersWSS)
+```
+
+The pinned-cert trust store is shared between both transports; the
+public operators serve the same certificate on the adjacent ports.
 
 ## Dependencies
 
 - Go 1.25+
 - `fiatjaf.com/nostr` (for `nostr.PubKey`, `nostr.ProfilePointer`, `nostr.PubKeyFromHex`)
-- Go standard library only otherwise — no new module dependencies.
+- `github.com/coder/websocket` for the WSS transport — zero transitive
+  dependencies, and already a transitive dep of `fiatjaf.com/nostr`.
+- Go standard library otherwise.
 
 ## Testing
 
