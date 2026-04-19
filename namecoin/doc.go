@@ -28,6 +28,10 @@
 //	    // ...
 //	}
 //
-// No external dependencies beyond the Go standard library and the
-// fiatjaf.com/nostr types.
+// Two transports are supported: raw TCP+TLS (the default, selected
+// by the zero value of ElectrumxServer.Transport) and WebSocket over
+// TLS (TransportWSS). The WSS path uses github.com/coder/websocket —
+// a zero-transitive-dep library that also compiles cleanly under
+// GOOS=js GOARCH=wasm, enabling browser use. Pinned-cert trust is
+// shared between the two transports.
 package namecoin
